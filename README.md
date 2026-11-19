@@ -76,11 +76,24 @@ adrive put ./report.pdf
 adrive share <resource_id> --ttl 7d
 ```
 
-**接收方在另一台机器上时，要告诉它你的服务地址**（`--server` 或环境变量 `ADRIVE_SERVER`）：
+### 跨机器 / 交给另一个 agent
+
+默认只监听 `127.0.0.1`，**别的机器连不上**。要给局域网用，发送方这样起：
+
+```bash
+adrive init --username <账号> --password <密码> \
+  --host 0.0.0.0 --public-base http://192.168.1.10:8787
+adrive-server          # 改了 host/port/public_base 必须重启才生效
+```
+
+接收方（不需要账号、不需要配置）用 `--server` 指向发送方：
 
 ```bash
 adrive get <resource_id> --server http://192.168.1.10:8787 -o ./downloads
 ```
+
+`--public-base` 必须写**接收方真正能访问到的地址**（局域网 IP 或公网域名），
+写 `127.0.0.1` 只有本机能取。
 
 `adrive share` 会打印一段给接收方 agent 的交接文案，原样转发即可：
 
@@ -101,7 +114,7 @@ adrive get Mqrx0O5E0jbYQeinW6h0dj --server http://192.168.1.10:8787
 | `adrive init --username --password [--public-base] [--port]` | 写配置 |
 | `adrive put <路径> [--name] [--json]` | 上传文件或目录（目录自动打包） |
 | `adrive share <id> [--ttl 7d] [--off]` | 开/关匿名下载（上限 7 天） |
-| `adrive get <id> [--server URL] [-o 目录]` | 取回；接收方用 `--server` 指向发布方，不需要账号 |
+| `adrive get <id> [--server URL] [-o 目录] [--force]` | 取回；接收方用 `--server` 指向发布方，不需要账号；本地已有同名文件默认拒绝覆盖 |
 | `adrive ls [--limit]` | 列出我的资源 |
 | `adrive rm <id>` | 删除资源（连蓝奏云对象一起删） |
 
@@ -226,8 +239,9 @@ adrive get Mqrx0O5E0jbYQeinW6h0dj --server http://192.168.1.10:8787
 
 ## 限制（重要）
 
-- **内存**：上传/下载/分片拼接都是整包在内存里（服务端 `Buffer.concat`，CLI `arrayBuffer`）。
-  实测 120MB 没问题；接近 `max_bytes`（默认 2GB）时请按机器内存调低，或等流式实现。
+- **内存**：上传/下载/分片拼接都是整包在内存里，实测**峰值约为文件大小的 4~5 倍**
+  （120MB 文件：CLI 约 470MB、服务端约 570MB）。`max_bytes` 默认 2GB 意味着理论上要 8GB+ 内存，
+  小机器请把它调到你内存的 1/5 左右。
 - **单进程**：状态在 `resources.json`，没有多实例锁。别对同一个 `~/.local/share/adrive` 起两个服务。
 - **软链**：默认跳过（会打印提示），`--follow-symlinks` 才跟随；跟随等于把链接目标内容发出去，自己确认。
 - **空目录**：会保留（zip 里有目录条目）。

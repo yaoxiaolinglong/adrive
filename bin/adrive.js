@@ -69,13 +69,27 @@ async function cmdInit(args) {
   const next = { ...cur, server: { ...(cur.server || {}) }, lanzou: { ...(cur.lanzou || {}) } };
   if (args.username) next.lanzou.username = args.username;
   if (args.password) next.lanzou.password = args.password;
-  if (args['public-base']) next.server.public_base = args['public-base'];
+  if (args.host) next.server.host = args.host;
   if (args.port) next.server.port = Number(args.port);
+  if (args['public-base']) {
+    next.server.public_base = args['public-base'];
+  } else if (args.port || args.host) {
+    // 端口/监听地址变了，服务地址跟着变，否则发送方会把请求打到旧端口
+    const host = next.server.host || '127.0.0.1';
+    const shown = host === '0.0.0.0' ? '127.0.0.1' : host;
+    next.server.public_base = `http://${shown}:${next.server.port}`;
+  }
   if (!next.server.token) next.server.token = crypto.randomBytes(24).toString('base64url');
   config.save(next);
 
   const cfg2 = config.load();
   console.log(`配置已写入 ${config.CONFIG_PATH}（权限 600，含蓝奏云密码明文，注意备份方式）`);
+  console.log('改动监听地址/端口/服务地址后，需要重启 adrive-server 才生效');
+  console.log(`监听：${cfg2.server.host}:${cfg2.server.port}   服务地址：${cfg2.server.public_base}`);
+  if (cfg2.server.host === '0.0.0.0') {
+    console.log('  提示：0.0.0.0 是对外监听，接收方要用你的局域网 IP 访问；');
+    console.log('        如果 public_base 还是 127.0.0.1，请用 --public-base http://<你的IP>:<端口> 指定');
+  }
   console.log(`API token: ${cfg2.server.token}`);
   console.log('  HTTP 接口用它：Authorization: Bearer <上面的 token>');
 
@@ -229,7 +243,31 @@ async function cmdGet(args) {
 
   const dl = await net(info.url);
   if (dl.status !== 200) die(`下载失败 ${dl.status}: ${await dl.text()}`);
-  const buf = Buffer.from(await dl.arrayBuffer());
+
+  // 带进度地把 body 读完（大文件几十秒静默会被当成卡死）
+  const total = Number(dl.headers.get('content-length') || 0);
+  const chunks = [];
+  let got = 0;
+  let lastPct = -10;
+  if (dl.body && dl.body.getReader) {
+    const reader = dl.body.getReader();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(Buffer.from(value));
+      got += value.length;
+      if (total > 5 * 1024 * 1024) {
+        const pct = Math.floor((got / total) * 100);
+        if (pct >= lastPct + 10) {
+          lastPct = pct;
+          console.error(`  下载中 ${pct}%（${(got / 1048576).toFixed(1)} / ${(total / 1048576).toFixed(1)} MB）`);
+        }
+      }
+    }
+  } else {
+    chunks.push(Buffer.from(await dl.arrayBuffer()));
+  }
+  const buf = Buffer.concat(chunks);
 
   if (info.sha256) {
     const got = crypto.createHash('sha256').update(buf).digest('hex');
@@ -242,12 +280,19 @@ async function cmdGet(args) {
   if ((info.kind || 'file') === 'file') {
     const dest = path.resolve(root, info.name);
     if (!dest.startsWith(root + path.sep)) die('非法文件名');
+    if (fs.existsSync(dest) && !args.force) {
+      die(`本地已存在 ${dest}，没有覆盖。\n  确认要覆盖就加 --force（或换 -o 目录）`);
+    }
     fs.writeFileSync(dest, buf);
     console.log(`已取回 1 个文件到 ${dest}（${buf.length} 字节，sha256 已校验）`);
     return;
   }
 
   const files = readZip(buf);
+  const clashes = files.filter((f) => !f.dir && fs.existsSync(path.resolve(root, f.name)));
+  if (clashes.length && !args.force) {
+    die(`本地已有同名文件（${clashes.length} 个），没有覆盖：\n  ${clashes.slice(0, 5).map((f) => f.name).join('\n  ')}\n  确认要覆盖就加 --force（或换 -o 目录）`);
+  }
   for (const f of files) {
     const dest = path.resolve(root, f.name);
     if (!dest.startsWith(root + path.sep)) die(`压缩包含不安全路径：${f.name}`);
@@ -302,10 +347,10 @@ async function cmdRm(args) {
 const USAGE = `adrive — agent 网盘（存储：蓝奏云）
 
 用法:
-  adrive init --username <账号> --password <密码> [--public-base URL] [--port 8787] [--no-verify]
+  adrive init --username <账号> --password <密码> [--host 0.0.0.0] [--port 8787] [--public-base URL] [--no-verify]
   adrive put <文件或目录> [--name 展示名] [--server URL] [--json]
   adrive share <resource_id> [--ttl 7d] [--off]
-  adrive get <resource_id> [--server URL] [-o 目录]
+  adrive get <resource_id> [--server URL] [-o 目录] [--force]
   adrive ls [--status active|pending|deleted|all] [--limit 50]
   adrive gc [--dry-run]          回收超时的未完成上传与过期墓碑
   adrive rm <resource_id>
@@ -334,6 +379,7 @@ function parseArgs(argv) {
   const argv = process.argv.slice(2);
   const cmd = argv.shift();
   const args = parseArgs(argv);
+  if (!cmd || args.help || cmd === 'help' || cmd === '--help') { console.log(USAGE); return; }
   const table = { init: cmdInit, put: cmdPut, share: cmdShare, get: cmdGet, ls: cmdLs, rm: cmdRm, gc: cmdGc };
   if (!cmd || !table[cmd]) return console.log(USAGE);
   try {
