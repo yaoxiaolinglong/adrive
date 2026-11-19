@@ -194,24 +194,38 @@ async function cmdGet(args) {
   let res = await net(`${BASE}/public/drive/ticket`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body,
   });
+  let usedOwner = false;
   if (res.status === 403) {
     const own = await net(`${BASE}/drive/ticket`, {
       method: 'POST', headers: { ...AUTH, 'Content-Type': 'application/json' }, body,
     });
-    if (own.status === 200) res = own;
+    if (own.status === 200) { res = own; usedOwner = true; }
   }
   const j = await res.json();
   if (res.status === 403) {
+    const code = j.error_code || '';
+    if (code === 'SHARE_EXPIRED') {
+      die(`匿名下载已经过期（${j.message || ''}）。\n`
+        + `  · 让发布方重新开一下：adrive share ${rid} --ttl 7d`);
+    }
     die(`这个资源没有开放匿名下载。\n`
       + `  · 你是发布者？在发布方机器上执行：adrive share ${rid} --ttl 7d\n`
       + `  · 你是接收方？让对方开一下匿名下载（默认不开）`);
   }
+  if (res.status === 409) {
+    die(`资源 ${rid} 还没上传完成（${j.message || 'pending'}），不能取。`);
+  }
   if (res.status === 404) {
     die(`在 ${BASE} 上找不到资源 ${rid}\n`
-      + `  · 服务地址对吗？用 --server 或 ADRIVE_SERVER 指定对方的地址`);
+      + `  · 服务地址对吗？用 --server 或 ADRIVE_SERVER 指定对方的地址\n`
+      + `  · 也可能资源已被发布方删除（删除不可恢复）`);
   }
   if (res.status !== 200) die(`取票失败 ${res.status}: ${JSON.stringify(j)}`);
   const info = j.data;
+  if (usedOwner) {
+    console.error('提示：本机有发布方凭据，走的是「本人票据」——匿名下载是否可用未验证。\n'
+      + '      要验收交接效果，请在接收方机器上（或干净 HOME）跑一次。');
+  }
 
   const dl = await net(info.url);
   if (dl.status !== 200) die(`下载失败 ${dl.status}: ${await dl.text()}`);

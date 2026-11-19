@@ -18,9 +18,9 @@ const CHUNK = cfg.limits.chunk_bytes || 95 * 1024 * 1024;
 
 const nowIso = () => new Date().toISOString();
 const newId = () => crypto.randomBytes(16).toString('base64url').replace(/[-_]/g, '').slice(0, 22);
-const sign = (rid, exp) => crypto.createHmac('sha256', TOKEN).update(`${rid}.${exp}`).digest('hex').slice(0, 32);
-const verify = (rid, exp, sig) => exp > Math.floor(Date.now() / 1000)
-  && crypto.timingSafeEqual(Buffer.from(sign(rid, exp)), Buffer.from(String(sig).padEnd(32).slice(0, 32)));
+const sign = (rid, exp, scope = 'public') => crypto.createHmac('sha256', TOKEN).update(`${rid}.${exp}.${scope}`).digest('hex').slice(0, 32);
+const verify = (rid, exp, sig, scope) => exp > Math.floor(Date.now() / 1000)
+  && crypto.timingSafeEqual(Buffer.from(sign(rid, exp, scope)), Buffer.from(String(sig).padEnd(32).slice(0, 32)));
 
 function json(res, code, body) {
   const buf = Buffer.from(JSON.stringify(body));
@@ -56,16 +56,21 @@ function parseTtl(ttl) {
   return Math.min(Number(m[1]) * mult, 7 * 86400);
 }
 
-function ticket(rec) {
+function ticket(rec, scope = 'public') {
   const exp = Math.floor(Date.now() / 1000) + 900;
   const base = cfg.server.public_base.replace(/\/$/, '');
   return {
-    url: `${base}/public/drive/${rec.id}/blob?exp=${exp}&sig=${sign(rec.id, exp)}`,
+    url: `${base}/public/drive/${rec.id}/blob?exp=${exp}&sig=${sign(rec.id, exp, scope)}&scope=${scope}`,
     expires_at: new Date(exp * 1000).toISOString(),
     name: rec.name, kind: rec.kind || 'file', size: rec.size, sha256: rec.sha256,
     parts: Math.max(1, Math.ceil(rec.size / CHUNK)),
   };
 }
+
+const hasBlob = (rec) => Boolean(rec && ((rec.parts || []).length || rec.file_id));
+const partsOf = (rec) => ((rec.parts || []).length
+  ? rec.parts.slice().sort((a, b) => a.index - b.index)
+  : (rec.file_id ? [{ index: 1, file_id: rec.file_id, share_url: rec.share_url }] : []));
 
 const meta = (r, status) => ({
   resource_id: r.id, name: r.name, size: r.size, sha256: r.sha256, kind: r.kind || 'file',
@@ -148,22 +153,28 @@ route('GET', /^\/drive$/, async (ctx) => {
 
 route('POST', /^\/drive\/ticket$/, async (ctx) => {
   const rec = store.get(ctx.body?.resource_id);
-  if (!rec || !(rec.parts || []).length) return [404, { code: 404, message: 'resource not found' }];
-  return { code: 0, data: ticket(rec) };
+  if (!rec || rec.status === 'deleted' || !hasBlob(rec)) return [404, { code: 404, message: 'resource not found' }];
+  if (rec.status !== 'active') return [409, { code: 409, error_code: 'RESOURCE_NOT_READY', message: '上传还没完成（commit 之前不能取）' }];
+  return { code: 0, data: ticket(rec, 'owner') };
 });
 
 route('POST', /^\/public\/drive\/ticket$/, async (ctx) => {
   const rec = store.get(ctx.body?.resource_id);
-  if (!rec || !(rec.parts || []).length) return [404, { code: 404, message: 'resource not found' }];
-  if (!rec.anonymous_until || rec.anonymous_until <= nowIso()) {
+  if (!rec || rec.status === 'deleted' || !hasBlob(rec)) return [404, { code: 404, message: 'resource not found' }];
+  if (rec.status !== 'active') return [409, { code: 409, error_code: 'RESOURCE_NOT_READY', message: '上传还没完成' }];
+  if (!rec.anonymous_until) {
     return [403, { code: 403, error_code: 'RESOURCE_NOT_SHARED', message: '未开放匿名下载' }];
   }
-  return { code: 0, data: ticket(rec) };
+  if (rec.anonymous_until <= nowIso()) {
+    return [403, { code: 403, error_code: 'SHARE_EXPIRED', message: `匿名下载已于 ${rec.anonymous_until} 过期` }];
+  }
+  return { code: 0, data: ticket(rec, 'public') };
 });
 
 route('PUT', /^\/drive\/([^/]+)\/anonymous$/, async (ctx) => {
   const rec = store.get(ctx.params[0]);
   if (!rec) return [404, { code: 404, message: 'resource not found' }];
+  if (rec.status !== 'active') return [409, { code: 409, error_code: 'RESOURCE_NOT_READY', message: '上传还没完成，不能分享' }];
   const ttl = parseTtl(ctx.body?.anonymous_ttl || '');
   if (ttl === null) return [400, { code: 400, message: 'bad anonymous_ttl' }];
   const until = ttl ? new Date(Date.now() + ttl * 1000).toISOString() : null;
@@ -201,11 +212,16 @@ const server = http.createServer(async (req, res) => {
   if (dl && req.method === 'GET') {
     const exp = Number(url.searchParams.get('exp'));
     const sig = url.searchParams.get('sig') || '';
-    if (!exp || !verify(dl[1], exp, sig)) return json(res, 403, { code: 403, message: 'bad signature' });
+    const scope = url.searchParams.get('scope') === 'owner' ? 'owner' : 'public';
+    if (!exp || !verify(dl[1], exp, sig, scope)) return json(res, 403, { code: 403, message: 'bad signature' });
     const rec = store.get(dl[1]);
-    if (!rec || !(rec.parts || []).length) return json(res, 404, { code: 404, message: 'resource not found' });
+    if (!rec || rec.status === 'deleted' || !hasBlob(rec)) return json(res, 404, { code: 404, message: 'resource not found' });
+    // 匿名链接在分享过期后必须立即失效（票有 15 分钟，但分享可能更短）
+    if (scope === 'public' && (!rec.anonymous_until || rec.anonymous_until <= nowIso())) {
+      return json(res, 403, { code: 403, error_code: 'SHARE_EXPIRED', message: '匿名下载已过期' });
+    }
     try {
-      const parts = (rec.parts || []).slice().sort((a, b) => a.index - b.index);
+      const parts = partsOf(rec);
       const chunks = [];
       for (const p of parts) chunks.push(await lz.download(p.share_url));
       const data = Buffer.concat(chunks);
