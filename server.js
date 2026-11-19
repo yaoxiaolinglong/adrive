@@ -107,7 +107,7 @@ const meta = (r, status) => ({
 const routes = [];
 const route = (method, pattern, handler) => routes.push({ method, pattern, handler });
 
-route('GET', /^\/health$/, async () => ({ code: 0, data: { ok: true, backend: 'lanzou', version: '0.1.0' } }));
+route('GET', /^\/health$/, async () => ({ code: 0, data: { ok: true, backend: 'lanzou', version: require('./package.json').version } }));
 
 route('POST', /^\/drive\/init$/, async (ctx) => {
   const { size, sha256, name, kind } = ctx.body || {};
@@ -163,6 +163,7 @@ route('PUT', /^\/drive\/([^/]+)\/blob$/, async (ctx) => {
     return [413, { code: 413, error_code: 'CHUNK_TOO_LARGE', message: `单片上限 ${CHUNK} 字节` }];
   }
   if (raw.length > CHUNK) return [413, { code: 413, error_code: 'CHUNK_TOO_LARGE', message: `单片上限 ${CHUNK} 字节` }];
+  if (raw.length === 0) return [422, { code: 422, error_code: 'EMPTY_BODY', message: '这一片是空的，没东西可传' }];
   const total = Math.max(1, Math.ceil(rec.size / CHUNK));
   const rawPart = ctx.query.get('part') || '1';
   if (!/^\d+$/.test(rawPart)) {
@@ -209,10 +210,14 @@ route('POST', /^\/drive\/commit$/, async (ctx) => {
 });
 
 route('GET', /^\/drive$/, async (ctx) => {
-  const limit = Math.max(1, Math.min(Number(ctx.query.get('limit') || 50), 500));
+  const rawLimit = ctx.query.get('limit');
+  if (rawLimit != null && !/^\d+$/.test(rawLimit)) {
+    return [422, { code: 422, error_code: 'INVALID_LIMIT', message: 'limit 必须是正整数' }];
+  }
+  const limit = Math.max(1, Math.min(Number(rawLimit || 50), 500));
   const status = ctx.query.get('status') || 'active';
   const hits = store.list({ limit, status }).map((r) => meta(r));
-  return { code: 0, data: { hits, total: hits.length } };
+  return { code: 0, data: { hits, total: store.count(status) } };
 });
 
 route('POST', /^\/drive\/ticket$/, async (ctx) => {
@@ -241,11 +246,17 @@ route('PUT', /^\/drive\/([^/]+)\/anonymous$/, async (ctx) => {
   const rec = store.get(ctx.params[0]);
   const err = stateError(rec);
   if (err) return err;
-  const ttl = parseTtl(ctx.body?.anonymous_ttl || '');
-  if (ttl === null) return [400, { code: 400, message: 'bad anonymous_ttl' }];
+  if (!ctx.body || ctx.body.anonymous_ttl == null) {
+    return [422, { code: 422, error_code: 'INVALID_TTL', message: 'anonymous_ttl 必填，关闭分享传空字符串 ""' }];
+  }
+  const ttl = parseTtl(ctx.body.anonymous_ttl);
+  if (ttl === null) {
+    return [422, { code: 422, error_code: 'INVALID_TTL', message: 'anonymous_ttl 格式：30m / 24h / 7d（上限 7d）' }];
+  }
   const until = ttl ? new Date(Date.now() + ttl * 1000).toISOString() : null;
   store.update(rec.id, { anonymous_until: until, updated_at: nowIso() });
-  return { code: 0, data: { resource_id: rec.id, anonymous_until: until, ttl: ctx.body?.anonymous_ttl || '' } };
+  const effTtl = ttl ? (ttl % 86400 === 0 ? `${ttl / 86400}d` : ttl % 3600 === 0 ? `${ttl / 3600}h` : ttl % 60 === 0 ? `${ttl / 60}m` : `${ttl}s`) : '';
+  return { code: 0, data: { resource_id: rec.id, anonymous_until: until, ttl: effTtl } };
 });
 
 route('DELETE', /^\/drive\/([^/]+)$/, async (ctx) => {
@@ -281,7 +292,11 @@ const server = http.createServer(async (req, res) => {
   if (dl && req.method === 'GET') {
     const exp = Number(url.searchParams.get('exp'));
     const sig = url.searchParams.get('sig') || '';
-    const scope = url.searchParams.get('scope') === 'owner' ? 'owner' : 'public';
+    const rawScope = url.searchParams.get('scope');
+    if (rawScope !== 'owner' && rawScope !== 'public') {
+      return json(res, 403, { code: 403, error_code: 'BAD_SCOPE', message: 'scope 必须是 owner 或 public' });
+    }
+    const scope = rawScope;
     if (!exp || !verify(dl[1], exp, sig, scope)) return json(res, 403, { code: 403, message: 'bad signature' });
     const rec = store.get(dl[1]);
     if (!rec || rec.status === 'deleted' || !hasBlob(rec)) {
@@ -302,16 +317,20 @@ const server = http.createServer(async (req, res) => {
           return json(res, 502, { code: 502, error_code: 'SHA_MISMATCH', message: '拼接后 sha256 不一致' });
         }
       }
+      const asciiFallback = String(rec.name).replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_');
       res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': data.length,
-        'Content-Disposition': `attachment; filename="${encodeURIComponent(rec.name)}"` });
+        'Content-Disposition': `attachment; filename="${asciiFallback}"; filename*=UTF-8''${encodeURIComponent(rec.name)}` });
       return res.end(data);
     } catch (e) {
       return json(res, 502, { code: 502, error_code: 'LANZOU_DOWNLOAD_FAILED', message: e.message });
     }
   }
 
+  // HEAD /health：给 k8s / LB 探针用
+  if (req.method === 'HEAD' && url.pathname === '/health') { res.writeHead(200); return res.end(); }
+
   const isPublic = url.pathname.startsWith('/public/') || url.pathname === '/health';
-  if (!isPublic && !auth(req)) return json(res, 401, { code: 401, error_code: 'UNAUTHORIZED' });
+  if (!isPublic && !auth(req)) return json(res, 401, { code: 401, error_code: 'UNAUTHORIZED', message: 'unauthorized' });
 
   for (const r of routes) {
     if (r.method !== req.method) continue;
@@ -321,11 +340,13 @@ const server = http.createServer(async (req, res) => {
     try {
       const rawRoute = req.method === 'PUT' && /^\/drive\/[^/]+\/blob$/.test(url.pathname);
       if (req.method !== 'GET' && req.method !== 'DELETE' && !rawRoute) {
-        const raw = req.__rawBody || (await readBody(req, MAX + 1024));
+        const limit = url.pathname.startsWith('/public/') ? 64 * 1024 : MAX + 1024;
+        const raw = req.__rawBody || (await readBody(req, limit));
         ctx.body = raw.length ? JSON.parse(raw.toString()) : {};
       }
     } catch (e) {
-      return json(res, e.code || 400, { code: e.code || 400, message: e.message });
+      if (e.code === 413) return json(res, 413, { code: 413, error_code: 'BODY_TOO_LARGE', message: '请求体过大' });
+      return json(res, 400, { code: 400, error_code: 'INVALID_JSON', message: '请求体不是合法 JSON' });
     }
     try {
       const out = await r.handler(ctx);
@@ -336,7 +357,12 @@ const server = http.createServer(async (req, res) => {
       return json(res, 500, { code: 500, message: e.message });
     }
   }
-  url.pathname.startsWith('/public/') ? json(res, 404, { code: 404 }) : json(res, 404, { code: 404, message: 'no route' });
+  if (routes.some((r) => r.pattern.test(url.pathname))) {
+    const allow = [...new Set(routes.filter((r) => r.pattern.test(url.pathname)).map((r) => r.method))];
+    res.setHeader('Allow', allow.join(', '));
+    return json(res, 405, { code: 405, error_code: 'METHOD_NOT_ALLOWED', message: `只支持 ${allow.join(', ')}` });
+  }
+  return json(res, 404, { code: 404, error_code: 'NOT_FOUND', message: 'no route' });
 });
 
 if (require.main === module) {
