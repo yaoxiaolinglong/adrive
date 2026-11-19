@@ -34,7 +34,7 @@ function readBody(req, limit) {
     let size = 0;
     req.on('data', (c) => {
       size += c.length;
-      if (size > limit) { reject(Object.assign(new Error('too large'), { code: 413 })); req.destroy(); return; }
+      if (size > limit) { reject(Object.assign(new Error('too large'), { code: 413 })); return; }
       chunks.push(c);
     });
     req.on('end', () => resolve(Buffer.concat(chunks)));
@@ -115,7 +115,17 @@ route('PUT', /^\/drive\/([^/]+)\/blob$/, async (ctx) => {
   const rec = store.get(ctx.params[0]);
   if (!rec) return [404, { code: 404, message: 'resource not found' }];
   if (rec.status !== 'pending') return [409, { code: 409, message: 'already committed' }];
-  const raw = await readBody(ctx.req, CHUNK + 4096);
+  // 先看 content-length，避免收完才发现超限（也避免连接被 reset）
+  const declared = Number(ctx.req.headers['content-length'] || 0);
+  if (declared > CHUNK) {
+    return [413, { code: 413, error_code: 'CHUNK_TOO_LARGE', message: `单片上限 ${CHUNK} 字节（本片 ${declared}）` }];
+  }
+  let raw;
+  try {
+    raw = await readBody(ctx.req, CHUNK + 4096);
+  } catch (e) {
+    return [413, { code: 413, error_code: 'CHUNK_TOO_LARGE', message: `单片上限 ${CHUNK} 字节` }];
+  }
   if (raw.length > CHUNK) return [413, { code: 413, error_code: 'CHUNK_TOO_LARGE', message: `单片上限 ${CHUNK} 字节` }];
   const total = Math.max(1, Math.ceil(rec.size / CHUNK));
   const part = Number(ctx.query.get('part') || 1);
