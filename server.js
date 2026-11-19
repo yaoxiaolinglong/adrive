@@ -10,6 +10,21 @@ const { Lanzou } = require('./lib/lanzou');
 const { Store } = require('./lib/store');
 const cfg = require('./lib/config').load();
 
+// 单实例锁：两个进程共用一个数据目录会互相覆盖
+const LOCK = require('node:path').join(require('./lib/store').DATA_DIR, 'server.pid');
+try {
+  if (require('node:fs').existsSync(LOCK)) {
+    const old = Number(require('node:fs').readFileSync(LOCK, 'utf8').trim());
+    if (old && old !== process.pid) {
+      try { process.kill(old, 0); console.error(`[adrive] 已有实例在跑（pid ${old}），本次退出。数据目录：${require('./lib/store').DATA_DIR}`); process.exit(1); } catch { /* 进程不在，继续 */ }
+    }
+  }
+  require('node:fs').writeFileSync(LOCK, String(process.pid));
+  process.on('exit', () => { try { require('node:fs').unlinkSync(LOCK); } catch { /* ignore */ } });
+} catch (e) {
+  console.error('[adrive] 写 pid 锁失败：' + e.message);
+}
+
 const store = new Store();
 const lz = new Lanzou(cfg.lanzou.username, cfg.lanzou.password);
 const TOKEN = cfg.server.token;
@@ -107,7 +122,12 @@ const meta = (r, status) => ({
 const routes = [];
 const route = (method, pattern, handler) => routes.push({ method, pattern, handler });
 
-route('GET', /^\/health$/, async () => ({ code: 0, data: { ok: true, backend: 'lanzou', version: require('./package.json').version } }));
+route('GET', /^\/health$/, async () => {
+  const ok = store.data && store.data.resources && typeof store.data.resources === 'object';
+  if (!ok) return [500, { code: 500, error_code: 'STORE_BROKEN', message: '资源库结构异常' }];
+  return { code: 0, data: { ok: true, backend: 'lanzou', version: require('./package.json').version,
+    resources: Object.keys(store.data.resources).length } };
+});
 
 route('POST', /^\/drive\/init$/, async (ctx) => {
   const { size, sha256, name, kind } = ctx.body || {};
@@ -178,10 +198,12 @@ route('PUT', /^\/drive\/([^/]+)\/blob$/, async (ctx) => {
   const partName = total > 1 ? `${rec.id}.p${String(part).padStart(3, '0')}.bin` : `${rec.id}.bin`;
   const info = await lz.upload(raw, partName);
 
+  // 上传耗时较长，期间别的请求可能改过记录：重新读一次再合并，避免互相覆盖
+  const fresh = store.get(rec.id) || rec;
   // 同一片重传：先把旧对象删掉，别留孤儿
-  const old = (rec.parts || []).find((p) => p.index === part);
+  const old = (fresh.parts || []).find((p) => p.index === part);
   if (old && old.file_id) { try { await lz.delete(old.file_id); } catch { /* 删不掉就算了 */ } }
-  const parts = (rec.parts || []).filter((p) => p.index !== part);
+  const parts = (fresh.parts || []).filter((p) => p.index !== part);
   parts.push({ index: part, file_id: info.fileId, share_id: info.shareId, share_url: info.shareUrl, size: raw.length });
   parts.sort((a, b) => a.index - b.index);
   store.update(rec.id, { parts, updated_at: nowIso() });

@@ -22,7 +22,7 @@ async function net(url, opts = {}) {
     return await fetch(url, opts);
   } catch (e) {
     const origin = (() => { try { return new URL(url).origin; } catch { return url; } })();
-    die(`连不上 ${origin}（${e.cause?.code || e.message}）\n`
+    throw new Error(`连不上 ${origin}（${e.cause?.code || e.message}）\n`
       + `  · 服务起来了吗？  adrive-server\n`
       + `  · 地址对不对？  用 --server 或环境变量 ADRIVE_SERVER 指定`);
   }
