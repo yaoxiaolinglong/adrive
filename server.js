@@ -19,8 +19,17 @@ const CHUNK = cfg.limits.chunk_bytes || 95 * 1024 * 1024;
 const nowIso = () => new Date().toISOString();
 const newId = () => crypto.randomBytes(16).toString('base64url').replace(/[-_]/g, '').slice(0, 22);
 const sign = (rid, exp, scope = 'public') => crypto.createHmac('sha256', TOKEN).update(`${rid}.${exp}.${scope}`).digest('hex').slice(0, 32);
+
+/** 定长安全比较：长度不同直接 false，绝不让 timingSafeEqual 抛错把进程带走 */
+function safeEqual(a, b) {
+  const ba = Buffer.from(String(a), 'utf8');
+  const bb = Buffer.from(String(b), 'utf8');
+  if (ba.length !== bb.length) return false;
+  try { return crypto.timingSafeEqual(ba, bb); } catch { return false; }
+}
+
 const verify = (rid, exp, sig, scope) => exp > Math.floor(Date.now() / 1000)
-  && crypto.timingSafeEqual(Buffer.from(sign(rid, exp, scope)), Buffer.from(String(sig).padEnd(32).slice(0, 32)));
+  && safeEqual(sign(rid, exp, scope), sig);
 
 function json(res, code, body) {
   const buf = Buffer.from(JSON.stringify(body));
@@ -44,8 +53,8 @@ function readBody(req, limit) {
 
 function auth(req) {
   const raw = req.headers.authorization || '';
-  const token = raw.startsWith('Bearer ') ? raw.slice(7) : '';
-  return token && token.length === TOKEN.length && crypto.timingSafeEqual(Buffer.from(token), Buffer.from(TOKEN));
+  if (!raw.startsWith('Bearer ')) return false;
+  return safeEqual(raw.slice(7), TOKEN);
 }
 
 function parseTtl(ttl) {
@@ -213,6 +222,9 @@ route('DELETE', /^\/drive\/([^/]+)$/, async (ctx) => {
   store.update(rec.id, { status: 'deleted', updated_at: nowIso() });
   return { code: 0, data: { resource_id: rec.id, name: rec.name, deleted: true, object_removed: removed } };
 });
+
+process.on('uncaughtException', (e) => console.error('[adrive] uncaughtException', e));
+process.on('unhandledRejection', (e) => console.error('[adrive] unhandledRejection', e));
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
