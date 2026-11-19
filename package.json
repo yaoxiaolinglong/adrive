@@ -1,6 +1,6 @@
 {
   "name": "@yxll/adrive",
-  "version": "0.2.0",
+  "version": "1.0.0",
   "description": "Agent-to-agent file drive backed by Lanzou Cloud. Zero dependency.",
   "bin": {
     "adrive": "bin/adrive.js",
