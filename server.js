@@ -76,6 +76,16 @@ function ticket(rec, scope = 'public') {
   };
 }
 
+/** 返回错误描述，合法则返回 null */
+function validateName(name) {
+  if (typeof name !== 'string' || !name.trim()) return 'name 不能为空';
+  if (name.length > 255) return `name 太长（${name.length} > 255）`;
+  if (/[\u0000-\u001f\u007f]/.test(name)) return 'name 不能包含控制字符';
+  if (name === '.' || name === '..') return 'name 不合法';
+  if (name.includes('/') || name.includes('\\')) return 'name 不能包含路径分隔符';
+  return null;
+}
+
 const hasBlob = (rec) => Boolean(rec && ((rec.parts || []).length || rec.file_id));
 const partsOf = (rec) => ((rec.parts || []).length
   ? rec.parts.slice().sort((a, b) => a.index - b.index)
@@ -94,8 +104,14 @@ route('GET', /^\/health$/, async () => ({ code: 0, data: { ok: true, backend: 'l
 
 route('POST', /^\/drive\/init$/, async (ctx) => {
   const { size, sha256, name, kind } = ctx.body || {};
-  if (!name) return [400, { code: 400, message: 'name required' }];
-  if (!(size >= 0)) return [400, { code: 400, message: 'size required' }];
+  const badName = validateName(name);
+  if (badName) return [422, { code: 422, error_code: 'INVALID_NAME', message: badName }];
+  if (!Number.isInteger(size) || size < 0) {
+    return [422, { code: 422, error_code: 'INVALID_SIZE', message: 'size 必须是非负整数（字节）' }];
+  }
+  if (sha256 != null && !/^[0-9a-f]{64}$/i.test(String(sha256))) {
+    return [422, { code: 422, error_code: 'INVALID_SHA256', message: 'sha256 必须是 64 位十六进制' }];
+  }
   if (size > MAX) return [413, { code: 413, error_code: 'PACK_TOO_LARGE', message: `单资源上限 ${MAX} 字节` }];
   const id = newId();
   const ts = nowIso();
@@ -137,13 +153,22 @@ route('PUT', /^\/drive\/([^/]+)\/blob$/, async (ctx) => {
   }
   if (raw.length > CHUNK) return [413, { code: 413, error_code: 'CHUNK_TOO_LARGE', message: `单片上限 ${CHUNK} 字节` }];
   const total = Math.max(1, Math.ceil(rec.size / CHUNK));
-  const part = Number(ctx.query.get('part') || 1);
-  if (!(part >= 1 && part <= total)) return [400, { code: 400, message: `part 越界（1..${total}）` }];
+  const rawPart = ctx.query.get('part') || '1';
+  if (!/^\d+$/.test(rawPart)) {
+    return [422, { code: 422, error_code: 'INVALID_PART', message: `part 必须是正整数，收到 ${rawPart}` }];
+  }
+  const part = Number(rawPart);
+  if (part < 1 || part > total) {
+    return [422, { code: 422, error_code: 'INVALID_PART', message: `part 越界（1..${total}），收到 ${part}` }];
+  }
 
   // 分片命名：<id>.p<NNN>.bin（.bin 不在白名单，由存储层自动伪装）
   const partName = total > 1 ? `${rec.id}.p${String(part).padStart(3, '0')}.bin` : `${rec.id}.bin`;
   const info = await lz.upload(raw, partName);
 
+  // 同一片重传：先把旧对象删掉，别留孤儿
+  const old = (rec.parts || []).find((p) => p.index === part);
+  if (old && old.file_id) { try { await lz.delete(old.file_id); } catch { /* 删不掉就算了 */ } }
   const parts = (rec.parts || []).filter((p) => p.index !== part);
   parts.push({ index: part, file_id: info.fileId, share_id: info.shareId, share_url: info.shareUrl, size: raw.length });
   parts.sort((a, b) => a.index - b.index);
@@ -155,9 +180,15 @@ route('POST', /^\/drive\/commit$/, async (ctx) => {
   const rec = store.get(ctx.body?.resource_id);
   if (!rec) return [404, { code: 404, message: 'resource not found' }];
   const total = Math.max(1, Math.ceil(rec.size / CHUNK));
-  const done = (rec.parts || []).length;
-  if (done < total) {
-    return [409, { code: 409, error_code: 'PARTS_INCOMPLETE', message: `分片未传完 ${done}/${total}` }];
+  const parts = (rec.parts || []).slice().sort((a, b) => a.index - b.index);
+  const missing = [];
+  for (let i = 1; i <= total; i++) if (!parts.find((p) => p.index === i)) missing.push(i);
+  if (missing.length) {
+    return [409, { code: 409, error_code: 'PARTS_INCOMPLETE', message: `分片未传完，缺 ${missing.join(',')}（共 ${total} 片）` }];
+  }
+  const bytes = parts.reduce((n, p) => n + (p.size || 0), 0);
+  if (bytes !== rec.size) {
+    return [409, { code: 409, error_code: 'SIZE_MISMATCH', message: `分片总字节 ${bytes} 与声明的 ${rec.size} 不一致` }];
   }
   store.update(rec.id, { status: 'active', updated_at: nowIso() });
   return { code: 0, data: meta(store.get(rec.id)) };
