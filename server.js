@@ -180,6 +180,15 @@ route('DELETE', /^\/drive\/([^/]+)$/, async (ctx) => {
   for (const fid of fileIds) {
     try { await lz.delete(fid); } catch { removed = false; }
   }
+  // 兜底：上传中断会留下「库里有记录但没进 parts」的幽灵片，按 <id>. 前缀扫一遍
+  try {
+    const all = await lz.files();
+    for (const f of all) {
+      if (String(f.name_all || '').startsWith(rec.id + '.')) {
+        try { await lz.delete(f.id); } catch { removed = false; }
+      }
+    }
+  } catch { /* 扫不到就算了，别让删除失败 */ }
   store.update(rec.id, { status: 'deleted', updated_at: nowIso() });
   return { code: 0, data: { resource_id: rec.id, name: rec.name, deleted: true, object_removed: removed } };
 });

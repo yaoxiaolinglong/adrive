@@ -125,9 +125,20 @@ async function cmdPut(args) {
   for (let i = 1; i <= total; i++) {
     const slice = payload.subarray((i - 1) * chunk, Math.min(i * chunk, payload.length));
     const url = total > 1 ? `${upload.url}?part=${i}` : upload.url;
-    const r = await net(url, { method: upload.method, headers: upload.headers, body: slice });
-    if (r.status !== 200) die(`第 ${i}/${total} 片上传失败 ${r.status}: ${await r.text()}`);
-    if (total > 1) console.error(`  分片 ${i}/${total} 完成（${(slice.length / 1048576).toFixed(1)} MB）`);
+    let r;
+    try {
+      r = await net(url, { method: upload.method, headers: upload.headers, body: slice });
+    } catch (e) {
+      die(`第 ${i}/${total} 片上传中断\n`
+        + `  resource_id: ${rid}\n`
+        + `  已上传的片留在蓝奏云里，清理：adrive rm ${rid}（会连残留对象一起删）`);
+    }
+    if (r.status !== 200) {
+      die(`第 ${i}/${total} 片上传失败 ${r.status}: ${await r.text()}\n`
+        + `  resource_id: ${rid}\n`
+        + `  清理：adrive rm ${rid}`);
+    }
+    if (total > 1) console.error(`  分片 ${i}/${total} 完成（${(slice.length / 1048576).toFixed(1)} MB，${Math.round(i / total * 100)}%）`);
   }
 
   const commitRes = await net(`${BASE}/drive/commit`, {
@@ -237,13 +248,16 @@ async function cmdGet(args) {
 
 async function cmdLs(args) {
   const BASE = resolveBase(args.server);
-  const res = await net(`${BASE}/drive?limit=${Number(args.limit || 50)}`, { headers: AUTH });
+  const status = args.all ? 'all' : (args.status || 'active');
+  const res = await net(`${BASE}/drive?limit=${Number(args.limit || 50)}&status=${encodeURIComponent(status)}`, { headers: AUTH });
   const j = await res.json();
   if (res.status !== 200) die(`列出失败 ${res.status}: ${JSON.stringify(j)}`);
   if (!j.data.hits.length) return console.log('（空）');
   for (const h of j.data.hits) {
-    console.log(`${h.resource_id}  ${String(h.size).padStart(10)}  ${h.status.padEnd(8)} ${h.name}`
-      + (h.anonymous_until ? `  匿名至 ${h.anonymous_until}` : ''));
+    const anon = h.anonymous_until
+      ? (h.anonymous_until <= new Date().toISOString() ? `  匿名已过期(${h.anonymous_until})` : `  匿名至 ${h.anonymous_until}`)
+      : '';
+    console.log(`${h.resource_id}  ${String(h.size).padStart(10)}  ${h.status.padEnd(8)} ${h.name}${anon}`);
   }
 }
 
