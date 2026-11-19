@@ -105,6 +105,25 @@ adrive get Mqrx0O5E0jbYQeinW6h0dj --server http://192.168.1.10:8787
 | `adrive ls [--limit]` | 列出我的资源 |
 | `adrive rm <id>` | 删除资源（连蓝奏云对象一起删） |
 
+### 错误码
+
+| HTTP | error_code | 含义 |
+|---|---|---|
+| 400 | `INVALID_JSON` | 请求体不是合法 JSON |
+| 401 | `UNAUTHORIZED` | 缺 token 或 token 不对 |
+| 403 | `RESOURCE_NOT_SHARED` | 还没开匿名下载 |
+| 403 | `SHARE_EXPIRED` | 匿名下载已过期 |
+| 403 | `BAD_SCOPE` / 签名不符 | 下载链接签名无效 |
+| 404 | `RESOURCE_NOT_FOUND` | 资源不存在或已删除 |
+| 405 | `METHOD_NOT_ALLOWED` | 方法不对（响应头带 `Allow`） |
+| 409 | `RESOURCE_NOT_READY` | 还没 commit |
+| 409 | `PARTS_INCOMPLETE` | 分片没传完（message 里列出缺哪几片） |
+| 409 | `SIZE_MISMATCH` | 分片总字节与声明的 size 不一致 |
+| 409 | `ALREADY_COMMITTED` | 已 commit 还继续传分片 |
+| 413 | `CHUNK_TOO_LARGE` / `PACK_TOO_LARGE` | 单片或整体超限 |
+| 422 | `INVALID_*` | 参数不合法（size/sha256/name/part/ttl/limit） |
+| 502 | `LANZOU_*` | 蓝奏云侧失败（上传/下载/校验） |
+
 ## 运行与数据
 
 - 服务是**前台进程**，`Ctrl-C` 停；要常驻自己套 systemd / launchd / pm2
