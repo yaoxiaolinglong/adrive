@@ -30,6 +30,22 @@ async function net(url, opts = {}) {
 
 function die(msg, code = 1) { console.error(msg); process.exit(code); }
 
+/** 先写 .part 再 rename：写失败不会留下「看起来完整」的半截文件 */
+function writeAtomic(dest, buf) {
+  const tmp = `${dest}.adrive-part`;
+  try {
+    fs.writeFileSync(tmp, buf);                 // 内部处理短写，出错会抛
+    const fd = fs.openSync(tmp, 'r+');
+    try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+    const size = fs.statSync(tmp).size;
+    if (size !== buf.length) throw Object.assign(new Error(`写入不完整 ${size}/${buf.length}`), { code: 'SHORT_WRITE' });
+    fs.renameSync(tmp, dest);
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch { /* ignore */ }
+    die(`写入失败（${e.code || e.message}），没有落下任何文件`);
+  }
+}
+
 function collect(p, opts = {}) {
   const entries = [];
   const st = fs.lstatSync(p);
@@ -251,6 +267,7 @@ async function cmdGet(args) {
   let lastPct = -10;
   if (dl.body && dl.body.getReader) {
     const reader = dl.body.getReader();
+    try {
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
@@ -263,6 +280,9 @@ async function cmdGet(args) {
           console.error(`  下载中 ${pct}%（${(got / 1048576).toFixed(1)} / ${(total / 1048576).toFixed(1)} MB）`);
         }
       }
+    }
+    } catch (e) {
+      die(`下载中断（${e.cause?.code || e.message}），没有写入任何文件，可以直接重试`);
     }
   } else {
     chunks.push(Buffer.from(await dl.arrayBuffer()));
@@ -283,7 +303,7 @@ async function cmdGet(args) {
     if (fs.existsSync(dest) && !args.force) {
       die(`本地已存在 ${dest}，没有覆盖。\n  确认要覆盖就加 --force（或换 -o 目录）`);
     }
-    fs.writeFileSync(dest, buf);
+    writeAtomic(dest, buf);
     console.log(`已取回 1 个文件到 ${dest}（${buf.length} 字节，sha256 已校验）`);
     return;
   }
@@ -293,12 +313,29 @@ async function cmdGet(args) {
   if (clashes.length && !args.force) {
     die(`本地已有同名文件（${clashes.length} 个），没有覆盖：\n  ${clashes.slice(0, 5).map((f) => f.name).join('\n  ')}\n  确认要覆盖就加 --force（或换 -o 目录）`);
   }
-  for (const f of files) {
-    const dest = path.resolve(root, f.name);
-    if (!dest.startsWith(root + path.sep)) die(`压缩包含不安全路径：${f.name}`);
-    if (f.dir) { fs.mkdirSync(dest, { recursive: true }); continue; }
-    fs.mkdirSync(path.dirname(dest), { recursive: true });
-    fs.writeFileSync(dest, f.data);
+  const stage = fs.mkdtempSync(path.join(root, '.adrive-tmp-'));
+  try {
+    for (const f of files) {
+      const dest = path.resolve(stage, f.name);
+      if (!dest.startsWith(stage + path.sep)) die(`压缩包含不安全路径：${f.name}`);
+      if (f.dir) { fs.mkdirSync(dest, { recursive: true }); continue; }
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      fs.writeFileSync(dest, f.data);
+      if (fs.statSync(dest).size !== f.data.length) throw new Error(`写入不完整：${f.name}`);
+    }
+    // 全部写成功后再搬到最终位置，避免半棵树
+    for (const f of files) {
+      const from = path.resolve(stage, f.name);
+      const to = path.resolve(root, f.name);
+      if (f.dir) { fs.mkdirSync(to, { recursive: true }); continue; }
+      fs.mkdirSync(path.dirname(to), { recursive: true });
+      fs.renameSync(from, to);
+    }
+  } catch (e) {
+    fs.rmSync(stage, { recursive: true, force: true });
+    die(`写入失败（${e.code || e.message}），没有落下任何文件`);
+  } finally {
+    fs.rmSync(stage, { recursive: true, force: true });
   }
   console.log(`已取回 ${files.length} 个文件到 ${root}（sha256 已校验）`);
   for (const f of files.slice(0, 10)) console.log(' -', f.name);
