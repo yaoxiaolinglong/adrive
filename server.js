@@ -86,6 +86,13 @@ function validateName(name) {
   return null;
 }
 
+/** 统一的资源状态判定，返回 [状态码, 响应体] 或 null */
+function stateError(rec) {
+  if (!rec || rec.status === 'deleted') return [404, { code: 404, error_code: 'RESOURCE_NOT_FOUND', message: 'resource not found（或已删除）' }];
+  if (rec.status === 'pending') return [409, { code: 409, error_code: 'RESOURCE_NOT_READY', message: '上传还没完成（commit 之前不可用）' }];
+  return null;
+}
+
 const hasBlob = (rec) => Boolean(rec && ((rec.parts || []).length || rec.file_id));
 const partsOf = (rec) => ((rec.parts || []).length
   ? rec.parts.slice().sort((a, b) => a.index - b.index)
@@ -138,8 +145,12 @@ route('POST', /^\/drive\/init$/, async (ctx) => {
 
 route('PUT', /^\/drive\/([^/]+)\/blob$/, async (ctx) => {
   const rec = store.get(ctx.params[0]);
-  if (!rec) return [404, { code: 404, message: 'resource not found' }];
-  if (rec.status !== 'pending') return [409, { code: 409, message: 'already committed' }];
+  if (!rec || rec.status === 'deleted') {
+    return [404, { code: 404, error_code: 'RESOURCE_NOT_FOUND', message: 'resource not found（或已删除）' }];
+  }
+  if (rec.status !== 'pending') {
+    return [409, { code: 409, error_code: 'ALREADY_COMMITTED', message: '资源已经 commit，不能继续上传' }];
+  }
   // 先看 content-length，避免收完才发现超限（也避免连接被 reset）
   const declared = Number(ctx.req.headers['content-length'] || 0);
   if (declared > CHUNK) {
@@ -178,7 +189,10 @@ route('PUT', /^\/drive\/([^/]+)\/blob$/, async (ctx) => {
 
 route('POST', /^\/drive\/commit$/, async (ctx) => {
   const rec = store.get(ctx.body?.resource_id);
-  if (!rec) return [404, { code: 404, message: 'resource not found' }];
+  if (!rec || rec.status === 'deleted') {
+    return [404, { code: 404, error_code: 'RESOURCE_NOT_FOUND', message: 'resource not found（或已删除）' }];
+  }
+  if (rec.status === 'active') return { code: 0, data: meta(rec) };   // 幂等
   const total = Math.max(1, Math.ceil(rec.size / CHUNK));
   const parts = (rec.parts || []).slice().sort((a, b) => a.index - b.index);
   const missing = [];
@@ -203,15 +217,17 @@ route('GET', /^\/drive$/, async (ctx) => {
 
 route('POST', /^\/drive\/ticket$/, async (ctx) => {
   const rec = store.get(ctx.body?.resource_id);
-  if (!rec || rec.status === 'deleted' || !hasBlob(rec)) return [404, { code: 404, message: 'resource not found' }];
-  if (rec.status !== 'active') return [409, { code: 409, error_code: 'RESOURCE_NOT_READY', message: '上传还没完成（commit 之前不能取）' }];
+  const err = stateError(rec);
+  if (err) return err;
+  if (!hasBlob(rec)) return [404, { code: 404, error_code: 'RESOURCE_NOT_FOUND', message: 'resource not found' }];
   return { code: 0, data: ticket(rec, 'owner') };
 });
 
 route('POST', /^\/public\/drive\/ticket$/, async (ctx) => {
   const rec = store.get(ctx.body?.resource_id);
-  if (!rec || rec.status === 'deleted' || !hasBlob(rec)) return [404, { code: 404, message: 'resource not found' }];
-  if (rec.status !== 'active') return [409, { code: 409, error_code: 'RESOURCE_NOT_READY', message: '上传还没完成' }];
+  const err = stateError(rec);
+  if (err) return err;
+  if (!hasBlob(rec)) return [404, { code: 404, error_code: 'RESOURCE_NOT_FOUND', message: 'resource not found' }];
   if (!rec.anonymous_until) {
     return [403, { code: 403, error_code: 'RESOURCE_NOT_SHARED', message: '未开放匿名下载' }];
   }
@@ -223,8 +239,8 @@ route('POST', /^\/public\/drive\/ticket$/, async (ctx) => {
 
 route('PUT', /^\/drive\/([^/]+)\/anonymous$/, async (ctx) => {
   const rec = store.get(ctx.params[0]);
-  if (!rec) return [404, { code: 404, message: 'resource not found' }];
-  if (rec.status !== 'active') return [409, { code: 409, error_code: 'RESOURCE_NOT_READY', message: '上传还没完成，不能分享' }];
+  const err = stateError(rec);
+  if (err) return err;
   const ttl = parseTtl(ctx.body?.anonymous_ttl || '');
   if (ttl === null) return [400, { code: 400, message: 'bad anonymous_ttl' }];
   const until = ttl ? new Date(Date.now() + ttl * 1000).toISOString() : null;
@@ -268,7 +284,9 @@ const server = http.createServer(async (req, res) => {
     const scope = url.searchParams.get('scope') === 'owner' ? 'owner' : 'public';
     if (!exp || !verify(dl[1], exp, sig, scope)) return json(res, 403, { code: 403, message: 'bad signature' });
     const rec = store.get(dl[1]);
-    if (!rec || rec.status === 'deleted' || !hasBlob(rec)) return json(res, 404, { code: 404, message: 'resource not found' });
+    if (!rec || rec.status === 'deleted' || !hasBlob(rec)) {
+      return json(res, 404, { code: 404, error_code: 'RESOURCE_NOT_FOUND', message: 'resource not found' });
+    }
     // 匿名链接在分享过期后必须立即失效（票有 15 分钟，但分享可能更短）
     if (scope === 'public' && (!rec.anonymous_until || rec.anonymous_until <= nowIso())) {
       return json(res, 403, { code: 403, error_code: 'SHARE_EXPIRED', message: '匿名下载已过期' });
