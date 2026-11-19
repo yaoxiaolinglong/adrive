@@ -67,12 +67,19 @@ npx github:yaoxiaolinglong/adrive ls
 # 1. 写入配置（会生成 API token，存在 ~/.config/adrive/config.json，权限 600）
 adrive init --username <蓝奏云账号> --password <蓝奏云密码>
 
-# 2. 起服务（默认 127.0.0.1:8787）
-adrive-server               # 或者 node server.js
+# 2. 起服务（默认 127.0.0.1:8787，前台运行，Ctrl-C 停）
+adrive-server
+# 从源码目录启动则是：node server.js
 
 # 3. 传东西
 adrive put ./report.pdf
 adrive share <resource_id> --ttl 7d
+```
+
+**接收方在另一台机器上时，要告诉它你的服务地址**（`--server` 或环境变量 `ADRIVE_SERVER`）：
+
+```bash
+adrive get <resource_id> --server http://192.168.1.10:8787 -o ./downloads
 ```
 
 `adrive share` 会打印一段给接收方 agent 的交接文案，原样转发即可：
@@ -81,7 +88,7 @@ adrive share <resource_id> --ttl 7d
 我用 agent 网盘给你传了一个资源：Mqrx0O5E0jbYQeinW6h0dj
 
 请执行这条命令取回：
-adrive get Mqrx0O5E0jbYQeinW6h0dj
+adrive get Mqrx0O5E0jbYQeinW6h0dj --server http://192.168.1.10:8787
 
 如果提示找不到 adrive，先按仓库 README 安装，再重试。
 取回后请告诉我文件放在了哪里、里面有什么，等我确认后再使用。
@@ -94,9 +101,15 @@ adrive get Mqrx0O5E0jbYQeinW6h0dj
 | `adrive init --username --password [--public-base] [--port]` | 写配置 |
 | `adrive put <路径> [--name] [--json]` | 上传文件或目录（目录自动打包） |
 | `adrive share <id> [--ttl 7d] [--off]` | 开/关匿名下载（上限 7 天） |
-| `adrive get <id> [-o 目录]` | 取回并解包（不需要账号） |
+| `adrive get <id> [--server URL] [-o 目录]` | 取回；接收方用 `--server` 指向发布方，不需要账号 |
 | `adrive ls [--limit]` | 列出我的资源 |
 | `adrive rm <id>` | 删除资源（连蓝奏云对象一起删） |
+
+## 运行与数据
+
+- 服务是**前台进程**，`Ctrl-C` 停；要常驻自己套 systemd / launchd / pm2
+- 资源元数据在 `~/.local/share/adrive/resources.json`（备份或彻底清空就动这个文件）
+- 配置在 `~/.config/adrive/config.json`，**里面有蓝奏云密码明文**（文件权限 600），别整目录打包外发
 
 ## HTTP 接口
 
