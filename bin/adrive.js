@@ -8,8 +8,25 @@ const { createZip, readZip } = require('../lib/zip');
 const config = require('../lib/config');
 
 const cfg = config.load();
-const BASE = cfg.server.public_base.replace(/\/$/, '');
 const AUTH = { Authorization: `Bearer ${cfg.server.token}` };
+
+/** 服务地址优先级：--server > ADRIVE_SERVER > 配置文件 > 本机默认 */
+function resolveBase(override) {
+  const raw = override || process.env.ADRIVE_SERVER || (cfg.server && cfg.server.public_base) || 'http://127.0.0.1:8787';
+  return String(raw).replace(/\/$/, '');
+}
+
+/** 统一的网络请求：连不上时给人话，而不是裸 fetch failed */
+async function net(url, opts = {}) {
+  try {
+    return await fetch(url, opts);
+  } catch (e) {
+    const origin = (() => { try { return new URL(url).origin; } catch { return url; } })();
+    die(`连不上 ${origin}（${e.cause?.code || e.message}）\n`
+      + `  · 服务起来了吗？  adrive-server\n`
+      + `  · 地址对不对？  用 --server 或环境变量 ADRIVE_SERVER 指定`);
+  }
+}
 
 function die(msg, code = 1) { console.error(msg); process.exit(code); }
 
@@ -55,7 +72,8 @@ async function cmdPut(args) {
   const payload = kind === 'file' ? fs.readFileSync(target) : createZip(collect(target));
   const sha256 = crypto.createHash('sha256').update(payload).digest('hex');
 
-  const initRes = await fetch(`${BASE}/drive/init`, {
+  const BASE = resolveBase(args.server);
+  const initRes = await net(`${BASE}/drive/init`, {
     method: 'POST', headers: { ...AUTH, 'Content-Type': 'application/json' },
     body: JSON.stringify({ size: payload.length, sha256, name, kind }),
   });
@@ -69,12 +87,12 @@ async function cmdPut(args) {
   for (let i = 1; i <= total; i++) {
     const slice = payload.subarray((i - 1) * chunk, Math.min(i * chunk, payload.length));
     const url = total > 1 ? `${upload.url}?part=${i}` : upload.url;
-    const r = await fetch(url, { method: upload.method, headers: upload.headers, body: slice });
+    const r = await net(url, { method: upload.method, headers: upload.headers, body: slice });
     if (r.status !== 200) die(`第 ${i}/${total} 片上传失败 ${r.status}: ${await r.text()}`);
     if (total > 1) console.error(`  分片 ${i}/${total} 完成（${(slice.length / 1048576).toFixed(1)} MB）`);
   }
 
-  const commitRes = await fetch(`${BASE}/drive/commit`, {
+  const commitRes = await net(`${BASE}/drive/commit`, {
     method: 'POST', headers: { ...AUTH, 'Content-Type': 'application/json' },
     body: JSON.stringify({ resource_id: rid }),
   });
@@ -92,7 +110,8 @@ async function cmdPut(args) {
 async function cmdShare(args) {
   const rid = args._[0];
   const ttl = args.off ? '' : (args.ttl || '7d');
-  const res = await fetch(`${BASE}/drive/${rid}/anonymous`, {
+  const BASE = resolveBase(args.server);
+  const res = await net(`${BASE}/drive/${rid}/anonymous`, {
     method: 'PUT', headers: { ...AUTH, 'Content-Type': 'application/json' },
     body: JSON.stringify({ anonymous_ttl: ttl }),
   });
@@ -111,15 +130,33 @@ async function cmdShare(args) {
 async function cmdGet(args) {
   const rid = args._[0];
   const out = args.o || args.output || '.';
-  const res = await fetch(`${BASE}/public/drive/ticket`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ resource_id: rid }),
+  const BASE = resolveBase(args.server);
+  const body = JSON.stringify({ resource_id: rid });
+
+  // 先走匿名票；403 时如果本机有 token，就退回「本人票」——自己的资源不必先 share
+  let res = await net(`${BASE}/public/drive/ticket`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body,
   });
-  if (res.status === 403) die('对方没有开放匿名下载（RESOURCE_NOT_SHARED）');
+  if (res.status === 403) {
+    const own = await net(`${BASE}/drive/ticket`, {
+      method: 'POST', headers: { ...AUTH, 'Content-Type': 'application/json' }, body,
+    });
+    if (own.status === 200) res = own;
+  }
   const j = await res.json();
+  if (res.status === 403) {
+    die(`这个资源没有开放匿名下载。\n`
+      + `  · 你是发布者？在发布方机器上执行：adrive share ${rid} --ttl 7d\n`
+      + `  · 你是接收方？让对方开一下匿名下载（默认不开）`);
+  }
+  if (res.status === 404) {
+    die(`在 ${BASE} 上找不到资源 ${rid}\n`
+      + `  · 服务地址对吗？用 --server 或 ADRIVE_SERVER 指定对方的地址`);
+  }
   if (res.status !== 200) die(`取票失败 ${res.status}: ${JSON.stringify(j)}`);
   const info = j.data;
 
-  const dl = await fetch(info.url);
+  const dl = await net(info.url);
   if (dl.status !== 200) die(`下载失败 ${dl.status}: ${await dl.text()}`);
   const buf = Buffer.from(await dl.arrayBuffer());
 
@@ -152,7 +189,8 @@ async function cmdGet(args) {
 }
 
 async function cmdLs(args) {
-  const res = await fetch(`${BASE}/drive?limit=${Number(args.limit || 50)}`, { headers: AUTH });
+  const BASE = resolveBase(args.server);
+  const res = await net(`${BASE}/drive?limit=${Number(args.limit || 50)}`, { headers: AUTH });
   const j = await res.json();
   if (res.status !== 200) die(`列出失败 ${res.status}: ${JSON.stringify(j)}`);
   if (!j.data.hits.length) return console.log('（空）');
@@ -164,7 +202,8 @@ async function cmdLs(args) {
 
 async function cmdRm(args) {
   const rid = args._[0];
-  const res = await fetch(`${BASE}/drive/${rid}`, { method: 'DELETE', headers: AUTH });
+  const BASE = resolveBase(args.server);
+  const res = await net(`${BASE}/drive/${rid}`, { method: 'DELETE', headers: AUTH });
   const j = await res.json();
   if (res.status !== 200) die(`删除失败 ${res.status}: ${JSON.stringify(j)}`);
   console.log(`已删除 ${j.data.resource_id}（蓝奏云对象${j.data.object_removed ? '已删' : '未删'}）`);
@@ -174,9 +213,9 @@ const USAGE = `adrive — agent 网盘（存储：蓝奏云）
 
 用法:
   adrive init --username <账号> --password <密码> [--public-base URL] [--port 8787]
-  adrive put <文件或目录> [--name 展示名] [--json]
+  adrive put <文件或目录> [--name 展示名] [--server URL] [--json]
   adrive share <resource_id> [--ttl 7d] [--off]
-  adrive get <resource_id> [-o 目录]
+  adrive get <resource_id> [--server URL] [-o 目录]
   adrive ls [--limit 50]
   adrive rm <resource_id>
 `;
