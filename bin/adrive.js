@@ -61,7 +61,13 @@ function collect(p, opts = {}) {
       }
       for (const name of names) {
         const full = path.join(dir, name);
-        const s = fs.lstatSync(full);
+        let s;
+        try {
+          s = fs.lstatSync(full);
+        } catch (e) {
+          console.error(`  跳过读不了的文件：${name}（${e.code || e.message}）`);
+          continue;
+        }
         if (s.isSymbolicLink()) {
           if (!opts.followSymlinks) {
             console.error(`  跳过软链：${path.relative(p, full)}`);
@@ -71,7 +77,13 @@ function collect(p, opts = {}) {
           if (real.isFile()) entries.push({ name: path.posix.join(root, path.relative(p, full)), data: fs.readFileSync(full) });
           continue;
         }
-        if (s.isFile()) entries.push({ name: path.posix.join(root, path.relative(p, full)), data: fs.readFileSync(full) });
+        if (s.isFile()) {
+          try {
+            entries.push({ name: path.posix.join(root, path.relative(p, full)), data: fs.readFileSync(full) });
+          } catch (e) {
+            console.error(`  跳过读不了的文件：${path.relative(p, full)}（${e.code || e.message}）`);
+          }
+        }
         else if (s.isDirectory()) walk(full);
       }
     };

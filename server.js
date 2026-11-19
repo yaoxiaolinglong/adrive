@@ -121,7 +121,10 @@ route('POST', /^\/drive\/init$/, async (ctx) => {
   if (!Number.isInteger(size) || size < 0) {
     return [422, { code: 422, error_code: 'INVALID_SIZE', message: 'size 必须是非负整数（字节）' }];
   }
-  if (sha256 != null && !/^[0-9a-f]{64}$/i.test(String(sha256))) {
+  if (sha256 == null) {
+    return [422, { code: 422, error_code: 'INVALID_SHA256', message: 'sha256 必填（64 位十六进制），用于取回时校验' }];
+  }
+  if (!/^[0-9a-f]{64}$/i.test(String(sha256))) {
     return [422, { code: 422, error_code: 'INVALID_SHA256', message: 'sha256 必须是 64 位十六进制' }];
   }
   if (size > MAX) return [413, { code: 413, error_code: 'PACK_TOO_LARGE', message: `单资源上限 ${MAX} 字节` }];
@@ -168,7 +171,14 @@ route('PUT', /^\/drive\/([^/]+)\/blob$/, async (ctx) => {
     return [413, { code: 413, error_code: 'CHUNK_TOO_LARGE', message: `单片上限 ${CHUNK} 字节` }];
   }
   if (raw.length > CHUNK) return [413, { code: 413, error_code: 'CHUNK_TOO_LARGE', message: `单片上限 ${CHUNK} 字节` }];
-  if (raw.length === 0) return [422, { code: 422, error_code: 'EMPTY_BODY', message: '这一片是空的，没东西可传' }];
+  if (raw.length === 0 && rec.size !== 0) {
+    return [422, { code: 422, error_code: 'EMPTY_BODY', message: '这一片是空的，没东西可传' }];
+  }
+  // 0 字节文件：合法，不往蓝奏云传东西，记一个空分片
+  if (rec.size === 0) {
+    store.update(rec.id, { parts: [{ index: 1, size: 0, file_id: null, share_url: null }], updated_at: nowIso() });
+    return { code: 0, data: { resource_id: rec.id, part: 1, size: 0, parts_done: 1, parts_total: 1 } };
+  }
   const total = Math.max(1, Math.ceil(rec.size / CHUNK));
   const rawPart = ctx.query.get('part') || '1';
   if (!/^\d+$/.test(rawPart)) {
@@ -349,7 +359,7 @@ const server = http.createServer(async (req, res) => {
     try {
       const parts = partsOf(rec);
       const chunks = [];
-      for (const p of parts) chunks.push(await lz.download(p.share_url));
+      for (const p of parts) chunks.push(p.share_url ? await lz.download(p.share_url) : Buffer.alloc(0));
       const data = Buffer.concat(chunks);
       if (rec.sha256) {
         const got = crypto.createHash('sha256').update(data).digest('hex');
