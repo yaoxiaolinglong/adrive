@@ -223,6 +223,9 @@ route('GET', /^\/drive$/, async (ctx) => {
   }
   const limit = Math.max(1, Math.min(Number(rawLimit || 50), 500));
   const status = ctx.query.get('status') || 'active';
+  if (!['active', 'pending', 'deleted', 'all'].includes(status)) {
+    return [422, { code: 422, error_code: 'INVALID_STATUS', message: 'status 可选：active / pending / deleted / all' }];
+  }
   const hits = store.list({ limit, status }).map((r) => meta(r));
   return { code: 0, data: { hits, total: store.count(status) } };
 });
