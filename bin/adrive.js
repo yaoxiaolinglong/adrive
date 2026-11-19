@@ -57,8 +57,32 @@ async function cmdInit(args) {
   if (args.password) next.lanzou.password = args.password;
   if (args['public-base']) next.server.public_base = args['public-base'];
   if (args.port) next.server.port = Number(args.port);
+  if (!next.server.token) next.server.token = crypto.randomBytes(24).toString('base64url');
   config.save(next);
-  console.log(`配置已写入 ${config.CONFIG_PATH}`);
+
+  const cfg2 = config.load();
+  console.log(`配置已写入 ${config.CONFIG_PATH}（权限 600，含蓝奏云密码明文，注意备份方式）`);
+  console.log(`API token: ${cfg2.server.token}`);
+  console.log('  HTTP 接口用它：Authorization: Bearer <上面的 token>');
+
+  if (args['no-verify']) return;
+  if (!cfg2.lanzou.username || !cfg2.lanzou.password) {
+    console.log('\n跳过登录校验：还没填 --username/--password');
+    return;
+  }
+  process.stdout.write('\n校验蓝奏云登录… ');
+  try {
+    const { Lanzou } = require('../lib/lanzou');
+    const lz = new Lanzou(cfg2.lanzou.username, cfg2.lanzou.password);
+    await lz.login();
+    console.log(`成功（uid ${lz.uid}）`);
+  } catch (e) {
+    console.log('失败');
+    die(`\n登录蓝奏云失败：${e.message}\n`
+      + '  · 账号密码对不对？（手机号 11 位，密码区分大小写）\n'
+      + '  · 连续失败可能触发风控，等几分钟再试\n'
+      + '  · 只想先写配置不校验：加 --no-verify');
+  }
 }
 
 async function cmdPut(args) {
@@ -212,7 +236,7 @@ async function cmdRm(args) {
 const USAGE = `adrive — agent 网盘（存储：蓝奏云）
 
 用法:
-  adrive init --username <账号> --password <密码> [--public-base URL] [--port 8787]
+  adrive init --username <账号> --password <密码> [--public-base URL] [--port 8787] [--no-verify]
   adrive put <文件或目录> [--name 展示名] [--server URL] [--json]
   adrive share <resource_id> [--ttl 7d] [--off]
   adrive get <resource_id> [--server URL] [-o 目录]
