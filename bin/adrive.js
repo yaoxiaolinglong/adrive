@@ -88,6 +88,7 @@ function collect(p, opts = {}) {
       }
     };
     walk(p);
+    if (!entries.length) entries.push({ name: root, dir: true });   // 空目录也要留个条目
   }
   return entries;
 }
@@ -171,9 +172,11 @@ async function cmdPut(args) {
     try {
       r = await net(url, { method: upload.method, headers: upload.headers, body: slice });
     } catch (e) {
-      die(`第 ${i}/${total} 片上传中断\n`
+      const done = i - 1;
+      die(`第 ${i}/${total} 片上传中断：${e.message}\n`
         + `  resource_id: ${rid}\n`
-        + `  已上传的片留在蓝奏云里，清理：adrive rm ${rid}（会连残留对象一起删）`);
+        + (done > 0 ? `  已传的 ${done} 片留在蓝奏云里，清理：adrive rm ${rid}\n` : '')
+        + `  常见原因：配置里的 public_base 指向了别的地址（服务端把上传地址烤进去了）`);
     }
     if (r.status !== 200) {
       die(`第 ${i}/${total} 片上传失败 ${r.status}: ${await r.text()}\n`
@@ -269,6 +272,13 @@ async function cmdGet(args) {
       + '      要验收交接效果，请在接收方机器上（或干净 HOME）跑一次。');
   }
 
+  if ((info.kind || 'file') === 'file') {
+    const early = path.resolve(path.resolve(out), info.name);
+    if (fs.existsSync(early) && !args.force) {
+      die(`本地已存在 ${early}，没有覆盖。\n  确认要覆盖就加 --force（或换 -o 目录）`);
+    }
+  }
+
   const dl = await net(info.url);
   if (dl.status !== 200) die(`下载失败 ${dl.status}: ${await dl.text()}`);
 
@@ -362,7 +372,7 @@ async function cmdLs(args) {
   if (res.status !== 200) die(`列出失败 ${res.status}: ${JSON.stringify(j)}`);
   if (!j.data.hits.length) return console.log('（空）');
   for (const h of j.data.hits) {
-    const anon = h.anonymous_until
+    const anon = h.status === 'deleted' ? '' : h.anonymous_until
       ? (h.anonymous_until <= new Date().toISOString() ? `  匿名已过期(${h.anonymous_until})` : `  匿名至 ${h.anonymous_until}`)
       : '';
     console.log(`${h.resource_id}  ${String(h.size).padStart(10)}  ${h.status.padEnd(8)} ${h.name}${anon}`);

@@ -434,6 +434,17 @@ function acquireLock() {
 
 if (require.main === module) {
   acquireLock();
+  server.on('error', (e) => {
+    if (e.code === 'EADDRINUSE') {
+      console.error(`[adrive] 端口 ${cfg.server.port} 已被占用，启动失败。`);
+      console.error(`  换个端口：adrive init --port ${cfg.server.port + 1} 然后重启`);
+      console.error('  （如果只是想确认是谁占着：ss -ltnp | grep ' + cfg.server.port + '）');
+      process.exit(1);
+    }
+    console.error('[adrive] 启动失败：' + e.message);
+    process.exit(1);
+  });
+
   server.listen(cfg.server.port, cfg.server.host, () => {
     console.log(`adrive listening on http://${cfg.server.host}:${cfg.server.port}  (backend: lanzou)`);
     gc().then((r) => {
