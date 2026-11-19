@@ -1,0 +1,252 @@
+#!/usr/bin/env node
+'use strict';
+// adrive 服务端：两段式上传 + 短期下载票，存储后端为蓝奏云。
+// 零依赖，只用 Node 内置模块。
+const http = require('node:http');
+const crypto = require('node:crypto');
+const { URL } = require('node:url');
+
+const { Lanzou } = require('./lib/lanzou');
+const { Store } = require('./lib/store');
+const cfg = require('./lib/config').load();
+
+const store = new Store();
+const lz = new Lanzou(cfg.lanzou.username, cfg.lanzou.password);
+const TOKEN = cfg.server.token;
+const MAX = cfg.limits.max_bytes;
+const CHUNK = cfg.limits.chunk_bytes || 95 * 1024 * 1024;
+
+const nowIso = () => new Date().toISOString();
+const newId = () => crypto.randomBytes(16).toString('base64url').replace(/[-_]/g, '').slice(0, 22);
+const sign = (rid, exp) => crypto.createHmac('sha256', TOKEN).update(`${rid}.${exp}`).digest('hex').slice(0, 32);
+const verify = (rid, exp, sig) => exp > Math.floor(Date.now() / 1000)
+  && crypto.timingSafeEqual(Buffer.from(sign(rid, exp)), Buffer.from(String(sig).padEnd(32).slice(0, 32)));
+
+function json(res, code, body) {
+  const buf = Buffer.from(JSON.stringify(body));
+  res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': buf.length });
+  res.end(buf);
+}
+
+function readBody(req, limit) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    req.on('data', (c) => {
+      size += c.length;
+      if (size > limit) { reject(Object.assign(new Error('too large'), { code: 413 })); req.destroy(); return; }
+      chunks.push(c);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+}
+
+function auth(req) {
+  const raw = req.headers.authorization || '';
+  const token = raw.startsWith('Bearer ') ? raw.slice(7) : '';
+  return token && token.length === TOKEN.length && crypto.timingSafeEqual(Buffer.from(token), Buffer.from(TOKEN));
+}
+
+function parseTtl(ttl) {
+  if (!ttl) return 0;
+  const m = String(ttl).match(/^(\d+)([smhd])$/);
+  if (!m) return null;
+  const mult = { s: 1, m: 60, h: 3600, d: 86400 }[m[2]];
+  return Math.min(Number(m[1]) * mult, 7 * 86400);
+}
+
+function ticket(rec) {
+  const exp = Math.floor(Date.now() / 1000) + 900;
+  const base = cfg.server.public_base.replace(/\/$/, '');
+  return {
+    url: `${base}/public/drive/${rec.id}/blob?exp=${exp}&sig=${sign(rec.id, exp)}`,
+    expires_at: new Date(exp * 1000).toISOString(),
+    name: rec.name, kind: rec.kind || 'file', size: rec.size, sha256: rec.sha256,
+    parts: Math.max(1, Math.ceil(rec.size / CHUNK)),
+  };
+}
+
+const meta = (r, status) => ({
+  resource_id: r.id, name: r.name, size: r.size, sha256: r.sha256, kind: r.kind || 'file',
+  parts: (r.parts || []).length, status: status || r.status,
+  anonymous_until: r.anonymous_until, created_at: r.created_at,
+});
+
+const routes = [];
+const route = (method, pattern, handler) => routes.push({ method, pattern, handler });
+
+route('GET', /^\/health$/, async () => ({ code: 0, data: { ok: true, backend: 'lanzou', version: '0.1.0' } }));
+
+route('POST', /^\/drive\/init$/, async (ctx) => {
+  const { size, sha256, name, kind } = ctx.body || {};
+  if (!name) return [400, { code: 400, message: 'name required' }];
+  if (!(size >= 0)) return [400, { code: 400, message: 'size required' }];
+  if (size > MAX) return [413, { code: 413, error_code: 'PACK_TOO_LARGE', message: `单资源上限 ${MAX} 字节` }];
+  const id = newId();
+  const ts = nowIso();
+  const parts = Math.max(1, Math.ceil(size / CHUNK));
+  store.put(id, {
+    id, name, size, kind: kind || 'file', sha256: sha256 || null, status: 'pending',
+    parts: [], anonymous_until: null, created_at: ts, updated_at: ts,
+  });
+  const base = cfg.server.public_base.replace(/\/$/, '');
+  return { code: 0, data: {
+    resource_id: id,
+    upload: {
+      mode: parts > 1 ? 'proxy-chunked' : 'proxy',
+      url: `${base}/drive/${id}/blob`,
+      method: 'PUT',
+      content_type: 'application/octet-stream',
+      parts,
+      chunk_size: CHUNK,
+      headers: { Authorization: `Bearer ${TOKEN}` },
+      expires_in: 3600,
+    },
+  } };
+});
+
+route('PUT', /^\/drive\/([^/]+)\/blob$/, async (ctx) => {
+  const rec = store.get(ctx.params[0]);
+  if (!rec) return [404, { code: 404, message: 'resource not found' }];
+  if (rec.status !== 'pending') return [409, { code: 409, message: 'already committed' }];
+  const raw = await readBody(ctx.req, CHUNK + 4096);
+  if (raw.length > CHUNK) return [413, { code: 413, error_code: 'CHUNK_TOO_LARGE', message: `单片上限 ${CHUNK} 字节` }];
+  const total = Math.max(1, Math.ceil(rec.size / CHUNK));
+  const part = Number(ctx.query.get('part') || 1);
+  if (!(part >= 1 && part <= total)) return [400, { code: 400, message: `part 越界（1..${total}）` }];
+
+  // 分片命名：<id>.p<NNN>.bin（.bin 不在白名单，由存储层自动伪装）
+  const partName = total > 1 ? `${rec.id}.p${String(part).padStart(3, '0')}.bin` : `${rec.id}.bin`;
+  const info = await lz.upload(raw, partName);
+
+  const parts = (rec.parts || []).filter((p) => p.index !== part);
+  parts.push({ index: part, file_id: info.fileId, share_id: info.shareId, share_url: info.shareUrl, size: raw.length });
+  parts.sort((a, b) => a.index - b.index);
+  store.update(rec.id, { parts, updated_at: nowIso() });
+  return { code: 0, data: { resource_id: rec.id, part, size: raw.length, parts_done: parts.length, parts_total: total } };
+});
+
+route('POST', /^\/drive\/commit$/, async (ctx) => {
+  const rec = store.get(ctx.body?.resource_id);
+  if (!rec) return [404, { code: 404, message: 'resource not found' }];
+  const total = Math.max(1, Math.ceil(rec.size / CHUNK));
+  const done = (rec.parts || []).length;
+  if (done < total) {
+    return [409, { code: 409, error_code: 'PARTS_INCOMPLETE', message: `分片未传完 ${done}/${total}` }];
+  }
+  store.update(rec.id, { status: 'active', updated_at: nowIso() });
+  return { code: 0, data: meta(store.get(rec.id)) };
+});
+
+route('GET', /^\/drive$/, async (ctx) => {
+  const limit = Math.max(1, Math.min(Number(ctx.query.get('limit') || 50), 500));
+  const status = ctx.query.get('status') || 'active';
+  const hits = store.list({ limit, status }).map((r) => meta(r));
+  return { code: 0, data: { hits, total: hits.length } };
+});
+
+route('POST', /^\/drive\/ticket$/, async (ctx) => {
+  const rec = store.get(ctx.body?.resource_id);
+  if (!rec || !(rec.parts || []).length) return [404, { code: 404, message: 'resource not found' }];
+  return { code: 0, data: ticket(rec) };
+});
+
+route('POST', /^\/public\/drive\/ticket$/, async (ctx) => {
+  const rec = store.get(ctx.body?.resource_id);
+  if (!rec || !(rec.parts || []).length) return [404, { code: 404, message: 'resource not found' }];
+  if (!rec.anonymous_until || rec.anonymous_until <= nowIso()) {
+    return [403, { code: 403, error_code: 'RESOURCE_NOT_SHARED', message: '未开放匿名下载' }];
+  }
+  return { code: 0, data: ticket(rec) };
+});
+
+route('PUT', /^\/drive\/([^/]+)\/anonymous$/, async (ctx) => {
+  const rec = store.get(ctx.params[0]);
+  if (!rec) return [404, { code: 404, message: 'resource not found' }];
+  const ttl = parseTtl(ctx.body?.anonymous_ttl || '');
+  if (ttl === null) return [400, { code: 400, message: 'bad anonymous_ttl' }];
+  const until = ttl ? new Date(Date.now() + ttl * 1000).toISOString() : null;
+  store.update(rec.id, { anonymous_until: until, updated_at: nowIso() });
+  return { code: 0, data: { resource_id: rec.id, anonymous_until: until, ttl: ctx.body?.anonymous_ttl || '' } };
+});
+
+route('DELETE', /^\/drive\/([^/]+)$/, async (ctx) => {
+  const rec = store.get(ctx.params[0]);
+  if (!rec) return [404, { code: 404, message: 'resource not found' }];
+  // 分片资源要逐片删，老记录可能只有单个 file_id
+  const fileIds = [...new Set([...(rec.parts || []).map((p) => p.file_id), rec.file_id].filter(Boolean))];
+  let removed = fileIds.length > 0;
+  for (const fid of fileIds) {
+    try { await lz.delete(fid); } catch { removed = false; }
+  }
+  store.update(rec.id, { status: 'deleted', updated_at: nowIso() });
+  return { code: 0, data: { resource_id: rec.id, name: rec.name, deleted: true, object_removed: removed } };
+});
+
+const server = http.createServer(async (req, res) => {
+  const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+
+  // 签名下载（无 Bearer，靠 URL 签名）
+  const dl = url.pathname.match(/^\/public\/drive\/([^/]+)\/blob$/);
+  if (dl && req.method === 'GET') {
+    const exp = Number(url.searchParams.get('exp'));
+    const sig = url.searchParams.get('sig') || '';
+    if (!exp || !verify(dl[1], exp, sig)) return json(res, 403, { code: 403, message: 'bad signature' });
+    const rec = store.get(dl[1]);
+    if (!rec || !(rec.parts || []).length) return json(res, 404, { code: 404, message: 'resource not found' });
+    try {
+      const parts = (rec.parts || []).slice().sort((a, b) => a.index - b.index);
+      const chunks = [];
+      for (const p of parts) chunks.push(await lz.download(p.share_url));
+      const data = Buffer.concat(chunks);
+      if (rec.sha256) {
+        const got = crypto.createHash('sha256').update(data).digest('hex');
+        if (got !== rec.sha256) {
+          return json(res, 502, { code: 502, error_code: 'SHA_MISMATCH', message: '拼接后 sha256 不一致' });
+        }
+      }
+      res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': data.length,
+        'Content-Disposition': `attachment; filename="${encodeURIComponent(rec.name)}"` });
+      return res.end(data);
+    } catch (e) {
+      return json(res, 502, { code: 502, error_code: 'LANZOU_DOWNLOAD_FAILED', message: e.message });
+    }
+  }
+
+  const isPublic = url.pathname.startsWith('/public/') || url.pathname === '/health';
+  if (!isPublic && !auth(req)) return json(res, 401, { code: 401, error_code: 'UNAUTHORIZED' });
+
+  for (const r of routes) {
+    if (r.method !== req.method) continue;
+    const m = url.pathname.match(r.pattern);
+    if (!m) continue;
+    const ctx = { req, res, params: m.slice(1), query: url.searchParams, body: null };
+    try {
+      const rawRoute = req.method === 'PUT' && /^\/drive\/[^/]+\/blob$/.test(url.pathname);
+      if (req.method !== 'GET' && req.method !== 'DELETE' && !rawRoute) {
+        const raw = req.__rawBody || (await readBody(req, MAX + 1024));
+        ctx.body = raw.length ? JSON.parse(raw.toString()) : {};
+      }
+    } catch (e) {
+      return json(res, e.code || 400, { code: e.code || 400, message: e.message });
+    }
+    try {
+      const out = await r.handler(ctx);
+      if (Array.isArray(out)) return json(res, out[0], out[1]);
+      return json(res, 200, out);
+    } catch (e) {
+      console.error('[adrive]', url.pathname, e);
+      return json(res, 500, { code: 500, message: e.message });
+    }
+  }
+  url.pathname.startsWith('/public/') ? json(res, 404, { code: 404 }) : json(res, 404, { code: 404, message: 'no route' });
+});
+
+if (require.main === module) {
+  server.listen(cfg.server.port, cfg.server.host, () => {
+    console.log(`adrive listening on http://${cfg.server.host}:${cfg.server.port}  (backend: lanzou)`);
+  });
+}
+
+module.exports = { server, app: { store, lz } };
