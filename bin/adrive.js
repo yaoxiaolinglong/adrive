@@ -30,17 +30,31 @@ async function net(url, opts = {}) {
 
 function die(msg, code = 1) { console.error(msg); process.exit(code); }
 
-function collect(p) {
+function collect(p, opts = {}) {
   const entries = [];
-  const st = fs.statSync(p);
+  const st = fs.lstatSync(p);
   if (st.isFile()) {
     entries.push({ name: path.basename(p), data: fs.readFileSync(p) });
   } else {
     const root = path.basename(path.resolve(p));
     const walk = (dir) => {
-      for (const name of fs.readdirSync(dir)) {
+      const names = fs.readdirSync(dir);
+      if (!names.length && dir !== p) {
+        entries.push({ name: path.posix.join(root, path.relative(p, dir)), dir: true });
+        return;
+      }
+      for (const name of names) {
         const full = path.join(dir, name);
-        const s = fs.statSync(full);
+        const s = fs.lstatSync(full);
+        if (s.isSymbolicLink()) {
+          if (!opts.followSymlinks) {
+            console.error(`  跳过软链：${path.relative(p, full)}`);
+            continue;
+          }
+          const real = fs.statSync(full);
+          if (real.isFile()) entries.push({ name: path.posix.join(root, path.relative(p, full)), data: fs.readFileSync(full) });
+          continue;
+        }
         if (s.isFile()) entries.push({ name: path.posix.join(root, path.relative(p, full)), data: fs.readFileSync(full) });
         else if (s.isDirectory()) walk(full);
       }
@@ -93,7 +107,7 @@ async function cmdPut(args) {
   const name = args.name || path.basename(path.resolve(target));
 
   // 单文件直传（不打 zip，省流量也避免大 zip 占内存）；目录才打包
-  const payload = kind === 'file' ? fs.readFileSync(target) : createZip(collect(target));
+  const payload = kind === 'file' ? fs.readFileSync(target) : createZip(collect(target, { followSymlinks: !!args['follow-symlinks'] }));
   const sha256 = crypto.createHash('sha256').update(payload).digest('hex');
 
   const BASE = resolveBase(args.server);
@@ -212,6 +226,7 @@ async function cmdGet(args) {
   for (const f of files) {
     const dest = path.resolve(root, f.name);
     if (!dest.startsWith(root + path.sep)) die(`压缩包含不安全路径：${f.name}`);
+    if (f.dir) { fs.mkdirSync(dest, { recursive: true }); continue; }
     fs.mkdirSync(path.dirname(dest), { recursive: true });
     fs.writeFileSync(dest, f.data);
   }
