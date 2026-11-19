@@ -275,6 +275,21 @@ async function cmdLs(args) {
   }
 }
 
+async function cmdGc(args) {
+  const BASE = resolveBase(args.server);
+  const res = await net(`${BASE}/gc`, {
+    method: 'POST', headers: { ...AUTH, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ dry_run: !!args['dry-run'] }),
+  });
+  const j = await res.json();
+  if (res.status !== 200) die(`回收失败 ${res.status}: ${JSON.stringify(j)}`);
+  const d = j.data;
+  const tag = d.dry_run ? '（演练，未实际删除）' : '';
+  console.log(`超时 pending：${d.pending.length} 条${tag}`);
+  for (const p of d.pending) console.log(`  ${p.id}  停在上传 ${p.age_h} 小时`);
+  console.log(`过期墓碑：${d.tombstones.length} 条${tag}`);
+}
+
 async function cmdRm(args) {
   const rid = args._[0];
   const BASE = resolveBase(args.server);
@@ -291,7 +306,8 @@ const USAGE = `adrive — agent 网盘（存储：蓝奏云）
   adrive put <文件或目录> [--name 展示名] [--server URL] [--json]
   adrive share <resource_id> [--ttl 7d] [--off]
   adrive get <resource_id> [--server URL] [-o 目录]
-  adrive ls [--limit 50]
+  adrive ls [--status active|pending|deleted|all] [--limit 50]
+  adrive gc [--dry-run]          回收超时的未完成上传与过期墓碑
   adrive rm <resource_id>
 `;
 
@@ -318,7 +334,7 @@ function parseArgs(argv) {
   const argv = process.argv.slice(2);
   const cmd = argv.shift();
   const args = parseArgs(argv);
-  const table = { init: cmdInit, put: cmdPut, share: cmdShare, get: cmdGet, ls: cmdLs, rm: cmdRm };
+  const table = { init: cmdInit, put: cmdPut, share: cmdShare, get: cmdGet, ls: cmdLs, rm: cmdRm, gc: cmdGc };
   if (!cmd || !table[cmd]) return console.log(USAGE);
   try {
     await table[cmd](args);

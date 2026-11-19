@@ -10,21 +10,6 @@ const { Lanzou } = require('./lib/lanzou');
 const { Store } = require('./lib/store');
 const cfg = require('./lib/config').load();
 
-// 单实例锁：两个进程共用一个数据目录会互相覆盖
-const LOCK = require('node:path').join(require('./lib/store').DATA_DIR, 'server.pid');
-try {
-  if (require('node:fs').existsSync(LOCK)) {
-    const old = Number(require('node:fs').readFileSync(LOCK, 'utf8').trim());
-    if (old && old !== process.pid) {
-      try { process.kill(old, 0); console.error(`[adrive] 已有实例在跑（pid ${old}），本次退出。数据目录：${require('./lib/store').DATA_DIR}`); process.exit(1); } catch { /* 进程不在，继续 */ }
-    }
-  }
-  require('node:fs').writeFileSync(LOCK, String(process.pid));
-  process.on('exit', () => { try { require('node:fs').unlinkSync(LOCK); } catch { /* ignore */ } });
-} catch (e) {
-  console.error('[adrive] 写 pid 锁失败：' + e.message);
-}
-
 const store = new Store();
 const lz = new Lanzou(cfg.lanzou.username, cfg.lanzou.password);
 const TOKEN = cfg.server.token;
@@ -295,7 +280,7 @@ route('DELETE', /^\/drive\/([^/]+)$/, async (ctx) => {
     const all = await lz.files();
     for (const f of all) {
       if (String(f.name_all || '').startsWith(rec.id + '.')) {
-        try { await lz.delete(f.id); } catch { removed = false; }
+        try { await lz.delete(f.id); removed = true; } catch { /* 单个失败不影响整体 */ }
       }
     }
   } catch { /* 扫不到就算了，别让删除失败 */ }
@@ -305,6 +290,36 @@ route('DELETE', /^\/drive\/([^/]+)$/, async (ctx) => {
 
 process.on('uncaughtException', (e) => console.error('[adrive] uncaughtException', e));
 process.on('unhandledRejection', (e) => console.error('[adrive] unhandledRejection', e));
+
+/** 回收：超时的 pending 资源（连蓝奏云对象）与过期的 deleted 墓碑 */
+async function gc({ dryRun = false, pendingTtlH = 24, tombstoneDays = 7 } = {}) {
+  const now = Date.now();
+  const out = { pending: [], tombstones: [], dry_run: dryRun };
+  for (const rec of Object.values(store.data.resources)) {
+    const ageH = (now - new Date(rec.updated_at || rec.created_at).getTime()) / 3600000;
+    if (rec.status === 'pending' && ageH > pendingTtlH) {
+      out.pending.push({ id: rec.id, age_h: Math.round(ageH) });
+      if (!dryRun) {
+        const ids = [...new Set([...(rec.parts || []).map((p) => p.file_id), rec.file_id].filter(Boolean))];
+        for (const fid of ids) { try { await lz.delete(fid); } catch { /* ignore */ } }
+        try {
+          const all = await lz.files();
+          for (const f of all) if (String(f.name_all || '').startsWith(rec.id + '.')) { try { await lz.delete(f.id); } catch { /* ignore */ } }
+        } catch { /* ignore */ }
+        store.clear(rec.id);
+      }
+    } else if (rec.status === 'deleted' && ageH > tombstoneDays * 24) {
+      out.tombstones.push({ id: rec.id, age_h: Math.round(ageH) });
+      if (!dryRun) store.clear(rec.id);
+    }
+  }
+  return out;
+}
+
+route('POST', /^\/gc$/, async (ctx) => {
+  const r = await gc({ dryRun: !!ctx.body?.dry_run, pendingTtlH: ctx.body?.pending_ttl_h ?? 24, tombstoneDays: ctx.body?.tombstone_days ?? 7 });
+  return { code: 0, data: r };
+});
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
@@ -387,9 +402,32 @@ const server = http.createServer(async (req, res) => {
   return json(res, 404, { code: 404, error_code: 'NOT_FOUND', message: 'no route' });
 });
 
+function acquireLock() {
+  const LOCK = require('node:path').join(require('./lib/store').DATA_DIR, 'server.pid');
+  try {
+    if (require('node:fs').existsSync(LOCK)) {
+      const old = Number(require('node:fs').readFileSync(LOCK, 'utf8').trim());
+      if (old && old !== process.pid) {
+        try { process.kill(old, 0); console.error(`[adrive] 已有实例在跑（pid ${old}），本次退出。数据目录：${require('./lib/store').DATA_DIR}`); process.exit(1); } catch { /* 进程不在，继续 */ }
+      }
+    }
+    require('node:fs').writeFileSync(LOCK, String(process.pid));
+    process.on('exit', () => { try { require('node:fs').unlinkSync(LOCK); } catch { /* ignore */ } });
+  } catch (e) {
+    console.error('[adrive] 写 pid 锁失败：' + e.message);
+  }
+
+}
+
 if (require.main === module) {
+  acquireLock();
   server.listen(cfg.server.port, cfg.server.host, () => {
     console.log(`adrive listening on http://${cfg.server.host}:${cfg.server.port}  (backend: lanzou)`);
+    gc().then((r) => {
+      if (r.pending.length || r.tombstones.length) {
+        console.log(`[adrive] 启动回收：pending ${r.pending.length} 条、墓碑 ${r.tombstones.length} 条`);
+      }
+    }).catch((e) => console.error('[adrive] 启动回收失败：' + e.message));
   });
 }
 
