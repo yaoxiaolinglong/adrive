@@ -133,7 +133,15 @@ async function cmdPut(args) {
 
 async function cmdShare(args) {
   const rid = args._[0];
-  const ttl = args.off ? '' : (args.ttl || '7d');
+  if (!rid) { console.log(USAGE); return; }
+  if (args.off && args.ttl) die('--off 和 --ttl 只能选一个');
+  let ttl = args.off ? '' : String(args.ttl || '7d');
+  if (ttl) {
+    const m = ttl.match(/^(\d+)([smhd])$/);
+    if (!m) die(`--ttl 写法不对：${ttl}\n  可选：30m / 24h / 7d（上限 7d）`);
+    const sec = Number(m[1]) * { s: 1, m: 60, h: 3600, d: 86400 }[m[2]];
+    if (sec > 7 * 86400) { console.error(`提示：--ttl ${ttl} 超过上限，已按 7d 处理`); ttl = '7d'; }
+  }
   const BASE = resolveBase(args.server);
   const res = await net(`${BASE}/drive/${rid}/anonymous`, {
     method: 'PUT', headers: { ...AUTH, 'Content-Type': 'application/json' },
@@ -146,7 +154,7 @@ async function cmdShare(args) {
   console.log('把下面这段发给接收方（原样，别改写）：\n');
   console.log(`我用 agent 网盘给你传了一个资源：${rid}\n`);
   console.log('请执行这条命令取回：');
-  console.log(`adrive get ${rid}\n`);
+  console.log(`adrive get ${rid} --server ${BASE}\n`);
   console.log('如果提示找不到 adrive，先按仓库 README 安装，再重试。');
   console.log('取回后请告诉我文件放在了哪里、里面有什么，等我确认后再使用。');
 }
@@ -250,9 +258,14 @@ function parseArgs(argv) {
     const a = argv[i];
     if (a === '-o') args.o = argv[++i];
     else if (a.startsWith('--')) {
-      const key = a.slice(2);
-      const next = argv[i + 1];
-      if (next && !next.startsWith('--')) { args[key] = next; i++; } else args[key] = true;
+      const body = a.slice(2);
+      if (body.includes('=')) {
+        const [k, ...rest] = body.split('=');
+        args[k] = rest.join('=');
+      } else {
+        const next = argv[i + 1];
+        if (next && !next.startsWith('--')) { args[body] = next; i++; } else args[body] = true;
+      }
     } else args._.push(a);
   }
   return args;
